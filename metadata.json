@@ -1,0 +1,6 @@
+{
+  "name": "Paranoid",
+  "description": "Cyberpunk encrypted zero-knowledge messenger with integrated .onion routing, Tor VPN, Tailscale tunnels, decentralized cloud, zero logs, automated TTL, and instant panic wipe.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
