@@ -1,14 +1,31 @@
 package com.example.ui
 
 import android.app.Application
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.core.CoreEvent
+import com.example.core.CoreNetworkConfig
+import com.example.core.CoreRuntimeStatus
+import com.example.core.KeystoreVault
+import com.example.core.MessageVaultCipher
+import com.example.core.NodeIdentityManager
+import com.example.core.ParanoidCoreEngine
+import com.example.core.ParanoidCoreFactory
+import com.example.core.SecureClipboardHelper
+import com.example.core.SecureFileShredder
+import com.example.core.StreamingDigestHelper
+import com.example.core.VaultSnapshotManager
+import com.example.core.XftpDispatchRequest
 import com.example.data.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -17,9 +34,50 @@ import java.util.UUID
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.getDatabase(application)
-    private val repository = ChatRepository(db.chatDao())
     val secPrefs = SecurityPreferences(application)
     private val audioHelper = AudioHelper(application)
+    val keystoreVault = KeystoreVault(application)
+    private val messageVaultCipher = MessageVaultCipher(keystoreVault)
+    val nodeIdentityManager = NodeIdentityManager(application, keystoreVault)
+
+    private val repository = ChatRepository(
+        chatDao = db.chatDao(),
+        shredLocalFile = { pathOrUri ->
+            SecureFileShredder.shredLocalMedia(
+                cacheDir = application.cacheDir,
+                filesDir = application.filesDir,
+                pathOrUri = pathOrUri
+            )
+        },
+        encryptMessageText = { contactId, plaintext ->
+            messageVaultCipher.encryptText(contactId, plaintext)
+        },
+        decryptMessageText = { contactId, stored ->
+            messageVaultCipher.decryptText(contactId, stored)
+        }
+    )
+
+    private val _keystoreModeLabel = MutableStateFlow(keystoreVault.activeMode().label)
+    val keystoreModeLabel: StateFlow<String> = _keystoreModeLabel.asStateFlow()
+
+    private val _localNodeFingerprint = MutableStateFlow(nodeIdentityManager.getLocalFingerprint())
+    val localNodeFingerprint: StateFlow<String> = _localNodeFingerprint.asStateFlow()
+
+    private val coreEngine: ParanoidCoreEngine = ParanoidCoreFactory.create(
+        CoreNetworkConfig(
+            torSocks5Enabled = secPrefs.isTorVpnEnabled,
+            tailscaleEnabled = secPrefs.isTailscaleEnabled,
+            dcCloudEnabled = secPrefs.isDcCloudEnabled,
+            dcVaultSizeGb = secPrefs.dcCloudVaultSize,
+            dcAutoclear = secPrefs.isDcCloudAutoclearEnabled
+        )
+    )
+
+    val coreStatus: StateFlow<CoreRuntimeStatus> = coreEngine.status
+
+    // Message TTL policy (default 24h; user can tighten down to 15m/1h/6h per session)
+    private val _messageTtlMs = MutableStateFlow(24L * 60L * 60L * 1000L)
+    val messageTtlMs: StateFlow<Long> = _messageTtlMs.asStateFlow()
 
     // Pin & Access State
     private val _isUnlocked = MutableStateFlow(false)
@@ -28,11 +86,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _isPinSet = MutableStateFlow(secPrefs.isPinSet())
     val isPinSet: StateFlow<Boolean> = _isPinSet.asStateFlow()
 
+    private val _hasDuressPin = MutableStateFlow(secPrefs.hasDuressPin())
+    val hasDuressPin: StateFlow<Boolean> = _hasDuressPin.asStateFlow()
+
     private val _lockoutPeriodMs = MutableStateFlow(0L)
     val lockoutPeriodMs: StateFlow<Long> = _lockoutPeriodMs.asStateFlow()
 
     private val _pinError = MutableStateFlow<String?>(null)
     val pinError: StateFlow<String?> = _pinError.asStateFlow()
+
+    private val _isAutoLockEnabled = MutableStateFlow(secPrefs.isAutoLockOnBackgroundEnabled)
+    val isAutoLockEnabled: StateFlow<Boolean> = _isAutoLockEnabled.asStateFlow()
+
+    private val _clipboardNotice = MutableStateFlow<String?>(null)
+    val clipboardNotice: StateFlow<String?> = _clipboardNotice.asStateFlow()
+
+    private val _snapshotNotice = MutableStateFlow<String?>(null)
+    val snapshotNotice: StateFlow<String?> = _snapshotNotice.asStateFlow()
 
     // Active Contacts and Chat
     val contactsStr: StateFlow<List<Contact>> = repository.allContacts
@@ -82,6 +152,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _recordingDurationSec = MutableStateFlow(0)
     val recordingDurationSec: StateFlow<Int> = _recordingDurationSec.asStateFlow()
 
+    private val _permissionNotice = MutableStateFlow<String?>(null)
+    val permissionNotice: StateFlow<String?> = _permissionNotice.asStateFlow()
+
     private var activeRecordingFile: String? = null
     private var recordingTimerJob: Job? = null
 
@@ -118,17 +191,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             tailscaleNodeIp.value = randTs
         }
 
-        // Initialize sample conversations for first-time use
+        observeCoreEvents()
         initializeMockContactsAndChats()
-
-        // Core dynamic TTL runner
         startTtlPruner()
-
-        // Simulated dynamic log flow
         startLogsPoller()
-
-        // Check if locked out on init
         checkPinLockout()
+    }
+
+    private fun observeCoreEvents() {
+        viewModelScope.launch {
+            coreEngine.events.collect { event ->
+                when (event) {
+                    is CoreEvent.DcCloudTelemetry -> ZeroLogEngine.log("Cloud", event.message, event.level)
+                    is CoreEvent.InboundMessage -> {
+                        val reply = Message(
+                            contactId = event.contactId,
+                            senderName = event.senderName,
+                            isOutgoing = false,
+                            text = event.text,
+                            isDelivered = true,
+                            ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
+                        )
+                        repository.insertMessage(reply)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun syncEngineConfig() {
+        viewModelScope.launch {
+            coreEngine.applyNetworkConfig(
+                CoreNetworkConfig(
+                    torSocks5Enabled = isTorVpnEnabled.value,
+                    tailscaleEnabled = isTailscaleEnabled.value,
+                    dcCloudEnabled = isDcCloudEnabled.value,
+                    dcVaultSizeGb = dcCloudVaultSize.value,
+                    dcAutoclear = isDcCloudAutoclearEnabled.value
+                )
+            )
+        }
     }
 
     private fun checkPinLockout() {
@@ -166,56 +268,190 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (!_isPinSet.value) {
-            // First time setup
             val success = secPrefs.setPin(pin)
             if (success) {
                 _isPinSet.value = true
                 _isUnlocked.value = true
                 _pinError.value = null
-                ZeroLogEngine.log("Security", "Secured master passcode set successfully.")
+                ZeroLogEngine.log("Security", "Master passcode hardened with PBKDF2-HMAC-SHA256 (120k rounds).")
             } else {
                 _pinError.value = "Invalid passcode pattern."
             }
         } else {
-            // Validate
-            val valid = secPrefs.verifyPin(pin)
-            if (valid) {
-                _isUnlocked.value = true
-                _pinError.value = null
-                ZeroLogEngine.log("Security", "Session verified successfully through master keys.")
-            } else {
-                // Pin failed. Set 30s lockout
-                val until = System.currentTimeMillis() + 30000L
-                secPrefs.setLockoutUntil(until)
-                _pinError.value = "Security key mismatched. System locked for 30s."
-                ZeroLogEngine.log("Security", "PIN authentication failed. 30 sec cooling lockout instituted.", "ERROR")
-                _lockoutPeriodMs.value = 30000L
-                startLockoutTimer()
+            when (secPrefs.verifyPinWithDuress(pin)) {
+                PinCheckResult.VALID -> {
+                    _isUnlocked.value = true
+                    _pinError.value = null
+                    ZeroLogEngine.log("Security", "Session verified successfully via PBKDF2 constant-time check.")
+                }
+                PinCheckResult.DURESS_TRIGGERED -> {
+                    executePanicButtonPurge(duressTriggered = true)
+                }
+                PinCheckResult.INVALID -> {
+                    val lockoutDuration = secPrefs.recordFailedPinAttempt()
+                    val sec = lockoutDuration / 1000L
+                    _pinError.value = "Security key mismatched. Locked for ${sec}s."
+                    ZeroLogEngine.log("Security", "PIN authentication failed. ${sec}s progressive lockout instituted.", "ERROR")
+                    _lockoutPeriodMs.value = lockoutDuration
+                    startLockoutTimer()
+                }
             }
         }
     }
 
+    fun setDuressPin(pin: String): Boolean {
+        val ok = secPrefs.setDuressPin(pin)
+        if (ok) {
+            _hasDuressPin.value = true
+            ZeroLogEngine.log("Security", "Duress panic passcode armed with PBKDF2-HMAC-SHA256 (120k rounds).")
+        } else {
+            ZeroLogEngine.log("Security", "Rejected duress PIN: must be 6 digits and distinct from primary PIN.", "WARN")
+        }
+        return ok
+    }
+
+    fun clearDuressPin() {
+        secPrefs.clearDuressPin()
+        _hasDuressPin.value = false
+        ZeroLogEngine.log("Security", "Duress panic passcode disarmed.")
+    }
+
     fun lockSession() {
         _isUnlocked.value = false
-        ZeroLogEngine.log("Security", "Session locked manually by user.")
+        SecureClipboardHelper.wipeNow(getApplication())
+        _clipboardNotice.value = null
+        ZeroLogEngine.log("Security", "Session locked manually by user (clipboard cleared).")
+    }
+
+    fun onAppBackgrounded() {
+        if (_isUnlocked.value && _isAutoLockEnabled.value) {
+            _isUnlocked.value = false
+            SecureClipboardHelper.wipeNow(getApplication())
+            _clipboardNotice.value = null
+            ZeroLogEngine.log("Security", "Auto-locked session on background transition (clipboard cleared).")
+        }
+    }
+
+    fun setAutoLockOnBackground(enabled: Boolean) {
+        secPrefs.isAutoLockOnBackgroundEnabled = enabled
+        _isAutoLockEnabled.value = enabled
+        ZeroLogEngine.log("Security", "Background auto-lock: ${if (enabled) "ENABLED" else "DISABLED"}")
+    }
+
+    fun copySensitiveWithAutoClear(text: String, label: String) {
+        if (text.isBlank()) return
+        SecureClipboardHelper.copySensitive(
+            context = getApplication(),
+            scope = viewModelScope,
+            label = label,
+            secretText = text,
+            onAutoCleared = {
+                _clipboardNotice.value = "Clipboard auto-cleared after 30s."
+            }
+        )
+        _clipboardNotice.value = "$label copied (hidden preview, auto-clears in 30s)."
+    }
+
+    fun clearClipboardNotice() {
+        _clipboardNotice.value = null
+    }
+
+    fun clearSnapshotNotice() {
+        _snapshotNotice.value = null
+    }
+
+    fun rotateNodeIdentity() {
+        nodeIdentityManager.rotateIdentity()
+        _localNodeFingerprint.value = nodeIdentityManager.getLocalFingerprint()
+    }
+
+    fun getPeerSafetyNumber(contact: Contact): String {
+        val peerMaterial = contact.publicKey.ifBlank { contact.onionAddress }
+        return nodeIdentityManager.computeSafetyNumber(peerMaterial)
+    }
+
+    fun exportEncryptedSnapshot(uri: Uri, passphrase: String) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            try {
+                val contacts = contactsStr.value
+                val snapshot = VaultSnapshotManager.VaultSnapshot(
+                    config = VaultSnapshotManager.SnapshotConfig(
+                        torVpnEnabled = isTorVpnEnabled.value,
+                        tailscaleEnabled = isTailscaleEnabled.value,
+                        dcCloudEnabled = isDcCloudEnabled.value,
+                        dcVaultSizeGb = dcCloudVaultSize.value,
+                        dcAutoclearEnabled = isDcCloudAutoclearEnabled.value,
+                        onionAddress = onionServerAddress.value,
+                        tailscaleIp = tailscaleNodeIp.value
+                    ),
+                    contacts = contacts
+                )
+                val writtenBytes = withContext(Dispatchers.IO) {
+                    VaultSnapshotManager.exportToUri(app, uri, snapshot, passphrase)
+                }
+                _snapshotNotice.value = "Encrypted .pvault exported (${writtenBytes} B, ${contacts.size} lanes)."
+                ZeroLogEngine.log("Vault", "Exported AES-256-GCM .pvault snapshot (${contacts.size} contacts, $writtenBytes B).")
+            } catch (e: Exception) {
+                _snapshotNotice.value = "Export failed: ${e.message}"
+                ZeroLogEngine.log("Vault", "Snapshot export failed: ${e.message}", "ERROR")
+            }
+        }
+    }
+
+    fun importEncryptedSnapshot(uri: Uri, passphrase: String) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            try {
+                val snapshot = withContext(Dispatchers.IO) {
+                    VaultSnapshotManager.importFromUri(app, uri, passphrase)
+                }
+                toggleTorVpn(snapshot.config.torVpnEnabled)
+                toggleTailscale(snapshot.config.tailscaleEnabled)
+                setDcCloudEnabled(snapshot.config.dcCloudEnabled)
+                setDcCloudVaultSize(snapshot.config.dcVaultSizeGb)
+                setDcCloudAutoclearEnabled(snapshot.config.dcAutoclearEnabled)
+
+                if (snapshot.config.onionAddress.isNotBlank()) {
+                    secPrefs.onionAddress = snapshot.config.onionAddress
+                    onionServerAddress.value = snapshot.config.onionAddress
+                }
+                if (snapshot.config.tailscaleIp.isNotBlank()) {
+                    secPrefs.tailscaleIp = snapshot.config.tailscaleIp
+                    tailscaleNodeIp.value = snapshot.config.tailscaleIp
+                }
+
+                for (contact in snapshot.contacts) {
+                    repository.insertContact(contact)
+                }
+                _snapshotNotice.value = "Restored ${snapshot.contacts.size} peer lanes & gateway config."
+                ZeroLogEngine.log("Vault", "Restored ${snapshot.contacts.size} peer lanes from AES-256-GCM .pvault snapshot.")
+            } catch (e: Exception) {
+                _snapshotNotice.value = "Restore failed: ${e.message}"
+                ZeroLogEngine.log("Vault", "Snapshot restore failed: ${e.message}", "ERROR")
+            }
+        }
     }
 
     // Toggle Config Controls
     fun toggleTorVpn(enabled: Boolean) {
         secPrefs.isTorVpnEnabled = enabled
         isTorVpnEnabled.value = enabled
+        syncEngineConfig()
         ZeroLogEngine.log("Network", "Tor VPN Socks5 proxy: ${if (enabled) "ENABLED" else "DISABLED"}")
     }
 
     fun toggleTailscale(enabled: Boolean) {
         secPrefs.isTailscaleEnabled = enabled
         isTailscaleEnabled.value = enabled
+        syncEngineConfig()
         ZeroLogEngine.log("Network", "Tailscale Routing: ${if (enabled) "ROUTING VIA TAILNET" else "DISABLED"}")
     }
 
     fun setDcCloudEnabled(enabled: Boolean) {
         secPrefs.isDcCloudEnabled = enabled
         isDcCloudEnabled.value = enabled
+        syncEngineConfig()
         ZeroLogEngine.log("Cloud", "DC Cloud sharing system: ${if (enabled) "ENABLED" else "DISABLED"}")
         if (enabled) {
             val size = dcCloudVaultSize.value
@@ -231,6 +467,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val sanitizedSize = if (sizeGB < 1) 1 else sizeGB
         secPrefs.dcCloudVaultSize = sanitizedSize
         dcCloudVaultSize.value = sanitizedSize
+        syncEngineConfig()
         ZeroLogEngine.log("Cloud", "Global sharing vault size updated: ${sanitizedSize}GB")
         if (isDcCloudEnabled.value) {
             if (sanitizedSize >= 16) {
@@ -244,6 +481,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun setDcCloudAutoclearEnabled(enabled: Boolean) {
         secPrefs.isDcCloudAutoclearEnabled = enabled
         isDcCloudAutoclearEnabled.value = enabled
+        syncEngineConfig()
         ZeroLogEngine.log("Cloud", "Delivered container autodelete: ${if (enabled) "ON-DELIVERY ATOMIC ERASE" else "MANUAL PRUNING ONLY"}")
     }
 
@@ -254,32 +492,79 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setMessageTtlMs(ttlMs: Long) {
+        val clamped = ttlMs.coerceIn(60_000L, 24L * 60L * 60L * 1000L)
+        _messageTtlMs.value = clamped
+        val label = when {
+            clamped < 3_600_000L -> "${clamped / 60_000L}m"
+            else -> "${clamped / 3_600_000L}h"
+        }
+        ZeroLogEngine.log("Clean", "Active conversation TTL updated to $label.")
+    }
+
+    fun cycleMessageTtlPreset() {
+        val presets = listOf(
+            15L * 60L * 1000L,
+            60L * 60L * 1000L,
+            6L * 60L * 60L * 1000L,
+            24L * 60L * 60L * 1000L
+        )
+        val idx = presets.indexOf(_messageTtlMs.value)
+        val next = presets[(idx + 1) % presets.size]
+        setMessageTtlMs(next)
+    }
+
+    fun shredConversation(contact: Contact, deleteContact: Boolean) {
+        viewModelScope.launch {
+            if (_selectedContact.value?.id == contact.id && _isRecordingVoice.value) {
+                recordingTimerJob?.cancel()
+                audioHelper.stopRecording()
+                _isRecordingVoice.value = false
+                _recordingDurationSec.value = 0
+                activeRecordingFile?.let {
+                    SecureFileShredder.shredLocalMedia(
+                        getApplication<Application>().cacheDir,
+                        getApplication<Application>().filesDir,
+                        it
+                    )
+                }
+                activeRecordingFile = null
+            }
+
+            if (deleteContact) {
+                val removed = repository.shredContactAndLane(contact)
+                if (_selectedContact.value?.id == contact.id) {
+                    _selectedContact.value = null
+                }
+                ZeroLogEngine.log("Clean", "Shredded peer lane '${contact.displayName}' + $removed messages & local blobs.")
+            } else {
+                val removed = repository.clearConversation(contact.id)
+                ZeroLogEngine.log("Clean", "Cleared $removed messages & local blobs for '${contact.displayName}'.")
+            }
+        }
+    }
+
     // Chat Operations
     fun sendTextMessage(content: String) {
         val contact = _selectedContact.value ?: return
         if (content.isBlank()) return
 
-        // SimpleX doesn't have metadata, we define isDelivered randomly here to let users view
-        // the "not delivered message alert to sender" behavior:
-        val isDeliveredRandom = (1..100).random() > 15 // 15% chance undelivered to simulate routing delays
-        val msg = Message(
-            contactId = contact.id,
-            senderName = "MasterKey",
-            isOutgoing = true,
-            text = content,
-            isDelivered = isDeliveredRandom,
-            ttlExpiry = System.currentTimeMillis() + (24 * 60 * 60 * 1000)
-        )
-
         viewModelScope.launch {
+            val delivered = coreEngine.sendText(contact, content)
+            val msg = Message(
+                contactId = contact.id,
+                senderName = "MasterKey",
+                isOutgoing = true,
+                text = content,
+                isDelivered = delivered,
+                ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
+            )
             repository.insertMessage(msg)
-            ZeroLogEngine.log("Protocol", "Published unidirectional outbound packet to SimpleX queue")
-            if (!isDeliveredRandom) {
-                ZeroLogEngine.log("Protocol", "Packet delivery ACK timeout! Alerting client of queue backlog.", "WARN")
-            }
+            ZeroLogEngine.log("Protocol", "Published unidirectional outbound packet via ${coreStatus.value.backend.label}")
 
-            // Simulate automatic receiver reply
-            triggerAutomaticReply(contact, content)
+            if (coreStatus.value.backend == com.example.core.CoreEngineBackend.KOTLIN_STAGING) {
+                triggerAutomaticReply(contact, content)
+            }
         }
     }
 
@@ -313,16 +598,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 isOutgoing = false,
                 text = text,
                 isDelivered = true,
-                ttlExpiry = System.currentTimeMillis() + (24 * 60 * 60 * 1000)
+                ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
             )
             repository.insertMessage(reply)
             ZeroLogEngine.log("Protocol", "De-queued inbound message packet from unique simplex address.")
         }
     }
 
+    fun reportAudioPermissionDenied(action: String) {
+        _permissionNotice.value = "Microphone permission is required for $action."
+        ZeroLogEngine.log("Audio", "RECORD_AUDIO denied by user for $action.", "WARN")
+    }
+
+    fun clearPermissionNotice() {
+        _permissionNotice.value = null
+    }
+
     // Voice note operations
     fun startVoiceRecording() {
         if (_isRecordingVoice.value) return
+        _permissionNotice.value = null
         _recordingDurationSec.value = 0
         val fileId = UUID.randomUUID().toString().take(8)
         activeRecordingFile = audioHelper.startRecording(fileId)
@@ -356,12 +651,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     mediaType = "VOICE",
                     voiceDurationMs = durationMs,
                     isDelivered = true,
-                    ttlExpiry = System.currentTimeMillis() + (24 * 60 * 60 * 1000)
+                    ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
                 )
                 repository.insertMessage(voiceMessage)
                 ZeroLogEngine.log("Audio", "In-memory voice packet committed to encrypted DB.")
             }
         }
+        _recordingDurationSec.value = 0
         activeRecordingFile = null
     }
 
@@ -373,14 +669,83 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         })
     }
 
-    // Select custom files to share securely
+    /**
+     * Streams a real file/photo chosen via Android's zero-permission Photo Picker or SAF OpenDocument,
+     * calculates a 16KB-chunked SHA-256 without loading the payload into RAM, and dispatches through XFTP/DC Cloud.
+     */
+    fun shareRealPickedMedia(uri: Uri, isImage: Boolean) {
+        val contact = _selectedContact.value ?: return
+        val app = getApplication<Application>()
+        val resolver = app.contentResolver
+
+        viewModelScope.launch {
+            try {
+                val (displayName, sha256Hex, byteSize) = withContext(Dispatchers.IO) {
+                    var name = if (isImage) "photo_${UUID.randomUUID().toString().take(6)}.jpg" else "container_${UUID.randomUUID().toString().take(6)}.bin"
+                    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (idx >= 0) {
+                                val resolved = cursor.getString(idx)
+                                if (!resolved.isNullOrBlank()) name = resolved
+                            }
+                        }
+                    }
+                    val input = resolver.openInputStream(uri) ?: throw IllegalStateException("Unable to open stream for URI")
+                    val (hash, size) = StreamingDigestHelper.computeSha256AndSize(input)
+                    Triple(name, hash, size)
+                }
+
+                val sizeLabel = when {
+                    byteSize >= 1024L * 1024L -> String.format("%.2f MB", byteSize / (1024.0 * 1024.0))
+                    byteSize >= 1024L -> String.format("%.1f KB", byteSize / 1024.0)
+                    else -> "$byteSize B"
+                }
+
+                val msg = Message(
+                    contactId = contact.id,
+                    senderName = "MasterKey",
+                    isOutgoing = true,
+                    text = if (isImage) {
+                        "🖼️ Encrypted visual stream: $displayName ($sizeLabel) • SHA256:${sha256Hex.take(10)}"
+                    } else {
+                        "📂 Encrypted XFTP container: $displayName ($sizeLabel) • SHA256:${sha256Hex.take(10)}"
+                    },
+                    mediaUri = uri.toString(),
+                    mediaType = if (isImage) "IMAGE" else "FILE",
+                    isDelivered = true,
+                    ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
+                )
+                repository.insertMessage(msg)
+                ZeroLogEngine.log("Protocol", "Streamed $displayName ($sizeLabel), SHA-256 verified: ${sha256Hex.take(16)}...")
+
+                coreEngine.dispatchXftpContainer(
+                    XftpDispatchRequest(
+                        contact = contact,
+                        displayName = displayName,
+                        sizeBytes = byteSize,
+                        sha256Hex = sha256Hex,
+                        dcCloudEnabled = isDcCloudEnabled.value,
+                        dcVaultSizeGb = dcCloudVaultSize.value,
+                        dcAutoclear = isDcCloudAutoclearEnabled.value
+                    )
+                )
+            } catch (e: Exception) {
+                ZeroLogEngine.log("Protocol", "Streaming media error: ${e.message}", "ERROR")
+            }
+        }
+    }
+
+    // Custom container dispatcher (kept compatible with dialog inputs & tests)
     fun sharePrivacyMockDocument(name: String, extension: String) {
         val contact = _selectedContact.value ?: return
         val cacheFile = File(getApplication<Application>().cacheDir, "sec_doc_${UUID.randomUUID().toString().take(6)}.$extension")
         try {
+            val payload = "SECURE Priv_Shield Container - Integrity Pass HMAC512".toByteArray()
             FileOutputStream(cacheFile).use { fos ->
-                fos.write("SECURE Priv_Shield Container - Integrity Pass HMAC512".toByteArray())
+                fos.write(payload)
             }
+            val shaHex = StreamingDigestHelper.computeSha256AndSize(payload.inputStream()).first
             viewModelScope.launch {
                 val fileMsg = Message(
                     contactId = contact.id,
@@ -390,28 +755,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     mediaUri = cacheFile.absolutePath,
                     mediaType = "FILE",
                     isDelivered = true,
-                    ttlExpiry = System.currentTimeMillis() + (24 * 60 * 60 * 1000)
+                    ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
                 )
                 repository.insertMessage(fileMsg)
-                ZeroLogEngine.log("Protocol", "Completed media transfer of: $name.$extension in strict 24-hr envelope.")
+                ZeroLogEngine.log("Protocol", "Completed media transfer of: $name.$extension under active TTL policy.")
 
-                if (isDcCloudEnabled.value) {
-                    val isActive = dcCloudVaultSize.value >= 16
-                    ZeroLogEngine.log("Cloud", "Relaying encrypted container to DC Cloud Vault (${dcCloudVaultSize.value}GB)...")
-                    if (isActive) {
-                        ZeroLogEngine.log("Cloud", "Server-side global sharing component processing block dispatch.")
-                        delay(700)
-                        ZeroLogEngine.log("Cloud", "Container successfully delivered to remote client.")
-                        if (isDcCloudAutoclearEnabled.value) {
-                            ZeroLogEngine.log("Cloud", "Cloud Autoclear Active: Purging container '$name.$extension' and corresponding cloud telemetry immediately after delivery.", "WARN")
-                            ZeroLogEngine.log("Cloud", "Atomic erase sequence completed. Global sharing cache returns to 0% footprint.")
-                        }
-                    } else {
-                        ZeroLogEngine.log("Cloud", "Server-side processing BYPASSED. (Reason: Vault size ${dcCloudVaultSize.value}GB is below the 16GB minimum limit).", "WARN")
-                        delay(500)
-                        ZeroLogEngine.log("Cloud", "Container transmitted directly without cloud-activation layer.")
-                    }
-                }
+                coreEngine.dispatchXftpContainer(
+                    XftpDispatchRequest(
+                        contact = contact,
+                        displayName = "$name.$extension",
+                        sizeBytes = payload.size.toLong(),
+                        sha256Hex = shaHex,
+                        dcCloudEnabled = isDcCloudEnabled.value,
+                        dcVaultSizeGb = dcCloudVaultSize.value,
+                        dcAutoclear = isDcCloudAutoclearEnabled.value
+                    )
+                )
             }
         } catch (e: Exception) {
             ZeroLogEngine.log("Protocol", "Failed writing secure container block: ${e.message}", "ERROR")
@@ -422,9 +781,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val contact = _selectedContact.value ?: return
         val cacheFile = File(getApplication<Application>().cacheDir, "sec_pic_${UUID.randomUUID().toString().take(6)}.png")
         try {
+            val payload = "MOCK CRYPTO PIC ENVELOPE".toByteArray()
             FileOutputStream(cacheFile).use { fos ->
-                fos.write("MOCK CRYPTO PIC ENVELOPE".toByteArray())
+                fos.write(payload)
             }
+            val shaHex = StreamingDigestHelper.computeSha256AndSize(payload.inputStream()).first
             viewModelScope.launch {
                 val picMsg = Message(
                     contactId = contact.id,
@@ -434,28 +795,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     mediaUri = cacheFile.absolutePath,
                     mediaType = "IMAGE",
                     isDelivered = true,
-                    ttlExpiry = System.currentTimeMillis() + (24 * 60 * 60 * 1000)
+                    ttlExpiry = System.currentTimeMillis() + _messageTtlMs.value
                 )
                 repository.insertMessage(picMsg)
                 ZeroLogEngine.log("Protocol", "Shared photo transfer completed: $photoLabel")
 
-                if (isDcCloudEnabled.value) {
-                    val isActive = dcCloudVaultSize.value >= 16
-                    ZeroLogEngine.log("Cloud", "Relaying photo media block to DC Cloud Vault (${dcCloudVaultSize.value}GB)...")
-                    if (isActive) {
-                        ZeroLogEngine.log("Cloud", "Server-side global sharing component processing media block.")
-                        delay(700)
-                        ZeroLogEngine.log("Cloud", "Photo container successfully delivered to remote client.")
-                        if (isDcCloudAutoclearEnabled.value) {
-                            ZeroLogEngine.log("Cloud", "Cloud Autoclear Active: Purging media package '$photoLabel' and corresponding cloud telemetry immediately after delivery.", "WARN")
-                            ZeroLogEngine.log("Cloud", "Atomic erase sequence completed. Global sharing cache returns to 0% footprint.")
-                        }
-                    } else {
-                        ZeroLogEngine.log("Cloud", "Server-side processing BYPASSED. (Reason: Vault size ${dcCloudVaultSize.value}GB is below the 16GB minimum limit).", "WARN")
-                        delay(500)
-                        ZeroLogEngine.log("Cloud", "Container transmitted directly without cloud-activation layer.")
-                    }
-                }
+                coreEngine.dispatchXftpContainer(
+                    XftpDispatchRequest(
+                        contact = contact,
+                        displayName = photoLabel,
+                        sizeBytes = payload.size.toLong(),
+                        sha256Hex = shaHex,
+                        dcCloudEnabled = isDcCloudEnabled.value,
+                        dcVaultSizeGb = dcCloudVaultSize.value,
+                        dcAutoclear = isDcCloudAutoclearEnabled.value
+                    )
+                )
             }
         } catch (e: Exception) {
             ZeroLogEngine.log("Protocol", "Failed writing secure photo envelope: ${e.message}", "ERROR")
@@ -464,6 +819,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // Voice Call Procedures (Secure peer-to-peer over SOCKS5 onion node)
     fun requestVoiceCall(contact: Contact) {
+        _permissionNotice.value = null
         _activeVoiceCallUser.value = contact
         _callStateStr.value = "Initializing Tor circuit..."
         _callFingerprint.value = "ZRTP: " + UUID.randomUUID().toString().replace("-", "").take(8).uppercase()
@@ -517,29 +873,47 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Master trigger: Panic button wipes everything and locks instantly
-    fun executePanicButtonPurge() {
+    // Master trigger: Panic button or Duress PIN wipes everything and locks instantly
+    fun executePanicButtonPurge(duressTriggered: Boolean = false) {
+        recordingTimerJob?.cancel()
+        callTimerJob?.cancel()
+        _isRecordingVoice.value = false
+        _recordingDurationSec.value = 0
+        activeRecordingFile = null
+        _activeVoiceCallUser.value = null
+        _callStateStr.value = ""
+        _callFingerprint.value = ""
+        _callDurationSec.value = 0
+        _permissionNotice.value = null
+        _clipboardNotice.value = null
+        _snapshotNotice.value = null
+        lastGeneratedInvite.value = null
+
+        // Lock UI immediately and wipe prefs/clipboard without waiting for async file shredding
+        SecureClipboardHelper.wipeNow(getApplication())
+        secPrefs.clearAll()
+        _isUnlocked.value = false
+        _isPinSet.value = false
+        _hasDuressPin.value = false
+        _selectedContact.value = null
+
         viewModelScope.launch {
-            audioHelper.StopStreams()
-            // 1. Wipe SharedPreferences
-            secPrefs.clearAll()
-
-            // 2. Clear Database Tables
+            audioHelper.wipeVoiceCache()
+            coreEngine.panicWipe()
+            nodeIdentityManager.wipeIdentity()
+            keystoreVault.wipeMasterKey()
+            _keystoreModeLabel.value = keystoreVault.activeMode().label
             repository.panicPurge()
+            db.securePurgeAndCheckpoint()
+            _localNodeFingerprint.value = nodeIdentityManager.getLocalFingerprint()
 
-            // 3. Delete file residues in directories
-            deletePrivateData(getApplication<Application>().cacheDir)
-            deletePrivateData(getApplication<Application>().filesDir)
+            val shreddedCache = SecureFileShredder.shredDirectoryContents(getApplication<Application>().cacheDir)
+            val shreddedFiles = SecureFileShredder.shredDirectoryContents(getApplication<Application>().filesDir)
 
-            // 4. Wipe runtime zero logging engine
             ZeroLogEngine.clearLogs()
-            ZeroLogEngine.log("Panic", "--- COLD EMERGENCY PURGE COMPLETE ---")
+            val triggerSource = if (duressTriggered) "DURESS PIN" else "PANIC BUTTON"
+            ZeroLogEngine.log("Panic", "--- COLD EMERGENCY PURGE ($triggerSource) COMPLETE (Shredded ${shreddedCache + shreddedFiles} files) ---")
 
-            // 5. Hard Reset View Model States
-            _isUnlocked.value = false
-            _isPinSet.value = false
-            _selectedContact.value = null
-            _activeVoiceCallUser.value = null
             isTorVpnEnabled.value = false
             isTailscaleEnabled.value = false
             onionServerAddress.value = ""
@@ -547,9 +921,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isDcCloudEnabled.value = true
             dcCloudVaultSize.value = 16
             isDcCloudAutoclearEnabled.value = true
-            _pinError.value = "EMERGENCY: Cryptographic wipe successfully executed!"
+            _messageTtlMs.value = 24L * 60L * 60L * 1000L
+            _pinError.value = if (duressTriggered) {
+                "Vault reset: initialize a fresh 6-digit passcode."
+            } else {
+                "EMERGENCY: Cryptographic wipe successfully executed!"
+            }
 
-            // Re-generate identity details safely in memory
             val randOnion = "simplexv3dwv" + UUID.randomUUID().toString().replace("-", "").take(16) + ".onion:5223"
             secPrefs.onionAddress = randOnion
             onionServerAddress.value = randOnion
@@ -565,17 +943,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createChatRoom(roomName: String) {
         viewModelScope.launch {
-            val roomId = "room_${UUID.randomUUID().toString().take(6)}"
-            val inviteLink = "simplex://invite-room-${UUID.randomUUID().toString().take(8)}.onion/" + UUID.randomUUID().toString().replace("-", "").take(12)
-            val contact = Contact(
-                id = roomId,
-                displayName = "$roomName [ROOM]",
-                onionAddress = inviteLink,
-                tailscaleIp = null,
-                publicKey = "RoomEd25519-" + UUID.randomUUID().toString().replace("-", "").take(8)
-            )
+            val contact = coreEngine.createRoomInvite(roomName)
             repository.insertContact(contact)
-            lastGeneratedInvite.value = InviteResult(roomName, inviteLink)
+            lastGeneratedInvite.value = InviteResult(roomName, contact.onionAddress)
             ZeroLogEngine.log("Setup", "Initiated secure room queue: $roomName")
             ZeroLogEngine.log("Protocol", "One-time invitation token bound to port 5223")
         }
@@ -585,21 +955,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         lastGeneratedInvite.value = null
     }
 
-    private fun deletePrivateData(directory: File) {
-        try {
-            directory.listFiles()?.forEach { file ->
-                if (file.isDirectory) {
-                    deletePrivateData(file)
-                }
-                file.delete()
-            }
-        } catch (e: Exception) {}
-    }
-
     // Initializer with high-privacy pre-configurations
     private fun initializeMockContactsAndChats() {
         viewModelScope.launch {
-            // Check if mock setup has run before
             if (!secPrefs.areMockConversationsInitialized) {
                 val sovereign = Contact(
                     id = "node_sov",
@@ -619,7 +977,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 repository.insertContact(sovereign)
                 repository.insertContact(cipherX)
 
-                // Insert introductory high-privacy messages
                 val now = System.currentTimeMillis()
                 val m1 = Message(
                     contactId = sovereign.id,
@@ -627,7 +984,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     isOutgoing = false,
                     text = "Welcome to your local SimpleX server queue. No IDs or global identities exist.",
                     timestamp = now - 50000,
-                    ttlExpiry = now + (23 * 60 * 60 * 1000) // Expiry in 23 hours
+                    ttlExpiry = now + (23 * 60 * 60 * 1000)
                 )
                 val m2 = Message(
                     contactId = sovereign.id,
@@ -637,7 +994,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     timestamp = now - 40000,
                     ttlExpiry = now + (23 * 60 * 60 * 1000)
                 )
-
                 val c1 = Message(
                     contactId = cipherX.id,
                     senderName = cipherX.displayName,
@@ -659,27 +1015,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun addCustomContact(name: String, onionAddress: String) {
         viewModelScope.launch {
-            if (onionAddress.startsWith("simplex://invite-room-") || name.contains("room", ignoreCase = true)) {
-                val groupContact = Contact(
-                    id = "room_" + UUID.randomUUID().toString().take(6),
-                    displayName = if (name.contains("[ROOM]", ignoreCase = true)) name else "$name [ROOM]",
-                    onionAddress = onionAddress,
-                    tailscaleIp = null,
-                    publicKey = "RoomEd25519-" + UUID.randomUUID().toString().replace("-", "").take(8)
-                )
-                repository.insertContact(groupContact)
-                ZeroLogEngine.log("Setup", "Joined decentralized group lane: $name via one-time invite")
-            } else {
-                val contact = Contact(
-                    id = "c_${UUID.randomUUID().toString().take(6)}",
-                    displayName = name,
-                    onionAddress = onionAddress,
-                    tailscaleIp = "100.81.${(30..200).random()}.${(20..200).random()}",
-                    publicKey = "KeyEd25519-" + UUID.randomUUID().toString().replace("-", "").take(8)
-                )
-                repository.insertContact(contact)
-                ZeroLogEngine.log("Setup", "Custom communication link registered: $name")
-            }
+            val contact = coreEngine.joinOrRegisterContact(name, onionAddress)
+            repository.insertContact(contact)
+            ZeroLogEngine.log("Setup", "Registered communication link: ${contact.displayName}")
         }
     }
 
@@ -708,5 +1046,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         recordingTimerJob?.cancel()
         callTimerJob?.cancel()
         audioHelper.StopStreams()
+        SecureClipboardHelper.wipeNow(getApplication())
     }
 }

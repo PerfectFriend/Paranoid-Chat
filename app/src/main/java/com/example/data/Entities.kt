@@ -55,9 +55,18 @@ interface ChatDao {
     @Query("DELETE FROM messages WHERE id = :id")
     suspend fun deleteMessage(id: Long)
 
-    // Automated 24h expiration query
+    // Automated 24h expiration query + orphan file cleanup helpers
+    @Query("SELECT mediaUri FROM messages WHERE ttlExpiry <= :currentTime AND mediaUri IS NOT NULL")
+    suspend fun getExpiredMediaUris(currentTime: Long): List<String>
+
     @Query("DELETE FROM messages WHERE ttlExpiry <= :currentTime")
     suspend fun pruneExpiredMessages(currentTime: Long): Int
+
+    @Query("SELECT mediaUri FROM messages WHERE contactId = :contactId AND mediaUri IS NOT NULL")
+    suspend fun getMediaUrisForContact(contactId: String): List<String>
+
+    @Query("DELETE FROM messages WHERE contactId = :contactId")
+    suspend fun deleteMessagesForContact(contactId: String): Int
 
     // Zero-Log / Panic purge of database
     @Query("DELETE FROM messages")

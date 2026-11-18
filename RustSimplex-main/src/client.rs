@@ -1,0 +1,262 @@
+//! SMP client over plain TCP or TLS 1.3 (rustls), pinning the router by keyHash.
+
+use std::net::SocketAddr;
+
+use crate::sb_chain::{read_block_encrypted, strict_keys, write_block_encrypted};
+use crate::crypto::*;
+use crate::encoding::{pad, unpad};
+use crate::protocol::*;
+use crate::transport::*;
+
+pub type ClResult<T> = Result<T, String>;
+
+/// Channel binding (spec appendix A): client asserts sessionIdentifier == tls-unique.
+/// TLS 1.3 has empty tls-unique (RFC 5929) and plain TCP uses "" — so sessionId must be empty.
+pub fn check_session_binding(sid: &[u8]) -> ClResult<()> {
+    // v0.26: TLS 1.3 sessionId = client Finished verify_data (32B); plain TCP may be empty.
+    // Length is enforced here; equality with the live TLS binding is verify_channel_binding().
+    if !(sid.is_empty() || sid.len() == 32) {
+        return Err("bad session id length".into());
+    }
+    Ok(())
+}
+
+/// SEC-04: when the caller has the live TLS binding (Finished verify_data or exporter),
+/// sessionId MUST equal it — rejects a MITM that rewrites serverHello sessionId.
+pub fn verify_channel_binding(sid: &[u8], tls_binding: &[u8]) -> ClResult<()> {
+    if sid == tls_binding && !sid.is_empty() {
+        Ok(())
+    } else {
+        Err("channel binding mismatch".into())
+    }
+}
+
+fn map_e<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+pub struct Client {
+    stream: BoxStream,
+    session_id: Vec<u8>,
+    /// strict v23 block-chain keys (Some => encryptBlock enabled); client side is swapped vs server
+    strict_snd: Option<[u8; 32]>,
+    strict_rcv: Option<[u8; 32]>,
+    pub server_key_hash: Vec<u8>,
+    /// per-connection ephemeral X25519 pub from server hello (authPubKey), used for box auth
+    pub server_eph_pub: Option<[u8; 32]>,
+    eph_priv: Option<[u8; 32]>,
+}
+
+impl Client {
+    fn handshake(stream: &mut BoxStream, key_hash: &[u8], tls_binding: Option<&[u8]>) -> ClResult<(Vec<u8>, Option<[u8; 32]>, [u8; 32])> {
+        let sh = read_block(stream).map_err(map_e)?;
+        eprintln!("[dbg] server hello block: len={} head={}", sh.len(), sh[..sh.len().min(48)].iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let (_min, _max, sid, auth_spki) = parse_server_hello_key(&sh).map_err(map_e)?;
+        eprintln!("[dbg] parsed: vRange {}..{} sid={}B auth={}", _min, _max, sid.len(), auth_spki.is_some());
+        // channel binding (spec appendix A): client MUST assert sessionIdentifier == tls-unique.
+        check_session_binding(&sid)?;
+        // SEC-04: enforce binding when the relay supplied a non-empty sessionId (TLS Finished); plain/local sid is empty.
+        if let Some(tb) = tls_binding { if !sid.is_empty() { verify_channel_binding(&sid, tb)?; } }
+        let eph = x25519_keypair();
+        let eph_priv = eph.secret.to_bytes();
+        let ch = client_hello_block_key(SMP_VERSION, key_hash, false, Some(spki_x25519(eph.public.as_bytes()))).map_err(map_e)?;
+        write_block(stream, &ch).map_err(map_e)?;
+        let eph = auth_spki.and_then(|der| parse_spki(&der).ok()).map(|(_a, raw)| raw);
+        Ok((sid, eph, eph_priv))
+    }
+
+    pub fn connect_plain(addr: SocketAddr, key_hash: &[u8]) -> ClResult<Client> {
+        let mut s = connect_plain(addr).map_err(map_e)?;
+        let (sid, eph, eph_priv) = Self::handshake(&mut s, key_hash, None)?;
+        { let mut c = Client { stream: s, session_id: sid, strict_snd: None, strict_rcv: None, server_key_hash: key_hash.to_vec(), server_eph_pub: eph, eph_priv: Some(eph_priv) }; c.maybe_enable_strict_env(); Ok(c) }
+    }
+
+    pub fn connect_tls(addr: SocketAddr, host: &str, key_hash: [u8; 32]) -> ClResult<Client> {
+        Self::connect_tls_sni(addr, host, key_hash, true)
+    }
+
+    /// When SMP_STRICT=1 and the server sent authPubKey, derive sessSecret and enable block encryption.
+    pub fn maybe_enable_strict_env(&mut self) {
+        if std::env::var("SMP_STRICT").as_deref() != Ok("1") { return; }
+        if let (Some(p), Some(srv)) = (self.eph_priv, self.server_eph_pub) {
+            let secret = x25519_dh(&p.into(), &x25519_public(srv));
+            self.enable_strict(&secret);
+        }
+    }
+
+    /// v0.26: with_sni=false — public relays route SNI connections to the web handler;
+    /// no-SNI gets the SMP protocol cert (same trick as XFTP v0.25).
+    pub fn connect_tls_sni(addr: SocketAddr, host: &str, key_hash: [u8; 32], with_sni: bool) -> ClResult<Client> {
+        let (mut s, binding) = crate::transport::connect_tls_sni_bound(addr, host, key_hash, with_sni).map_err(map_e)?;
+        let (sid, eph, eph_priv) = Self::handshake(&mut s, &key_hash, Some(&binding))?;
+        { let mut c = Client { stream: s, session_id: sid, strict_snd: None, strict_rcv: None, server_key_hash: key_hash.to_vec(), server_eph_pub: eph, eph_priv: Some(eph_priv) }; c.maybe_enable_strict_env(); Ok(c) }
+    }
+
+    /// Enable strict v23 transport block encryption for this session (requires authPubKey/sessSecret).
+    pub fn enable_strict(&mut self, dh_secret: &[u8; 32]) {
+        let (snd, rcv) = strict_keys(&self.session_id, dh_secret, true);
+        self.strict_snd = Some(snd);
+        self.strict_rcv = Some(rcv);
+    }
+
+    /// X25519 box-auth shared secret for a queue whose auth key is `qauth_kp`:
+    /// dhSecret = DH(queue auth priv, server per-connection eph pub) — C.cbAuthenticate k pk.
+    pub fn box_secret(&self, qauth_kp: &X25519Keypair) -> Option<[u8; 32]> {
+        let srv = self.server_eph_pub?;
+        Some(x25519_dh(&qauth_kp.secret, &x25519_public(srv)))
+    }
+
+    /// Send one command transmission (signed if `auth` given) and read one response block.
+    pub fn request(&mut self, cmd: Command, entity_id: Vec<u8>, auth: Option<&Ed25519Keypair>) -> ClResult<Vec<BrokerMsg>> {
+        let mut t = Transmission {
+            authenticator: Vec::new(),
+            corr_id: random_bytes(24),
+            entity_id,
+            command: encode_command(&cmd).map_err(map_e)?,
+        };
+        if let Some(kp) = auth {
+            auth_sign(&self.session_id, &mut t, kp).map_err(map_e)?;
+        }
+        let wire = encode_transmission(&t).map_err(map_e)?;
+        if let Some(snd) = self.strict_snd.as_mut() {
+            let raw = encode_block_raw(&[wire]).map_err(map_e)?;
+            write_block_encrypted(&mut self.stream, snd, &raw).map_err(map_e)?;
+        } else {
+            let blk = encode_block(&[wire]).map_err(map_e)?;
+            write_block(&mut self.stream, &blk).map_err(map_e)?;
+        }
+        self.recv_block()
+    }
+
+    /// Send one command authorized with the X25519 crypto_box authenticator
+    /// (secretbox(dhSecret, cbNonce(corrId), sha512(authorized)) = 80 bytes) and read one response block.
+    pub fn request_box(&mut self, cmd: Command, entity_id: Vec<u8>, dh_secret: &[u8; 32]) -> ClResult<Vec<BrokerMsg>> {
+        let mut t = Transmission {
+            authenticator: Vec::new(),
+            corr_id: random_bytes(24),
+            entity_id,
+            command: encode_command(&cmd).map_err(map_e)?,
+        };
+        auth_box(&self.session_id, &mut t, dh_secret).map_err(map_e)?;
+        let wire = encode_transmission(&t).map_err(map_e)?;
+        if let Some(snd) = self.strict_snd.as_mut() {
+            let raw = encode_block_raw(&[wire]).map_err(map_e)?;
+            write_block_encrypted(&mut self.stream, snd, &raw).map_err(map_e)?;
+        } else {
+            let blk = encode_block(&[wire]).map_err(map_e)?;
+            write_block(&mut self.stream, &blk).map_err(map_e)?;
+        }
+        self.recv_block()
+    }
+
+    /// Read one block and parse all broker messages in it (responses + pushed MSG).
+    pub fn recv_block(&mut self) -> ClResult<Vec<BrokerMsg>> {
+        let rb = if let Some(rcv) = self.strict_rcv.as_mut() {
+            read_block_encrypted(&mut self.stream, rcv).map_err(map_e)?
+        } else {
+            read_block(&mut self.stream).map_err(map_e)?
+        };
+        if let Ok(path) = std::env::var("SMP_DUMP_RAW") {
+            use std::io::Write;
+            let p = if path.is_empty() || path == "1" {
+                std::env::temp_dir().join("raw_blocks.hex") // TMPDIR points at the hermes scratch dir
+            } else {
+                std::path::PathBuf::from(path)
+            };
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "{}", rb.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            }
+        }
+        let wires = if self.strict_rcv.is_some() { decode_block_raw(&rb).map_err(map_e)? } else { decode_block(&rb).map_err(map_e)? };
+        let mut out = Vec::new();
+        for w in wires {
+            let t = decode_transmission(&w).map_err(map_e)?;
+            out.push(parse_broker(&t.command).map_err(map_e)?);
+        }
+        Ok(out)
+    }
+
+    /// PRXY: ask this router to open a proxied session to dest. Returns the PKEY.
+    pub fn proxy_open(&mut self, dest_host: &str, dest_port: u16) -> ClResult<BrokerMsg> {
+        let r = self
+            .request(
+                Command::Proxy { host: dest_host.as_bytes().to_vec(), port: dest_port.to_string().into_bytes(), auth: None },
+                vec![],
+                None,
+            )
+            .map_err(map_e)?;
+        r.into_iter().next().ok_or_else(|| "empty PRXY response".into())
+    }
+
+    /// PFWD: send a command via the proxy session to the destination router.
+    /// `pkey` = the PKEY response; returns decrypted broker messages from PRES.
+    pub fn pfwd(&mut self, pkey: &BrokerMsg, cmd: Command, entity_id: Vec<u8>, auth: Option<&Ed25519Keypair>) -> ClResult<Vec<BrokerMsg>> {
+        let BrokerMsg::Pkey { session_id, cert_key, .. } = pkey else {
+            return Err("expected PKEY".into());
+        };
+        let (_a, dest_pub_raw) = parse_spki(cert_key).map_err(map_e)?;
+        let dest_pub = x25519_public(dest_pub_raw);
+        // per-command ephemeral key
+        let eph = x25519_keypair();
+        let client_sess = x25519_dh(&eph.secret, &dest_pub);
+        // inner transmission (signed with OUR session id on the proxy connection, as usual)
+        let mut t = Transmission {
+            authenticator: Vec::new(),
+            corr_id: random_bytes(24),
+            entity_id,
+            command: encode_command(&cmd).map_err(map_e)?,
+        };
+        if let Some(kp) = auth {
+            auth_sign(&self.session_id, &mut t, kp).map_err(map_e)?;
+        }
+        let wire = encode_transmission(&t).map_err(map_e)?;
+        let padded = pad(&wire, crate::proxy::PROXIED_T_LEN).map_err(map_e)?;
+        let nonce = cb_nonce(&t.corr_id);
+        let enc = secretbox_encrypt(&client_sess, &nonce, &padded);
+        // PFWD transmission: entity = proxy session id, unsigned
+        let pfwd_cmd = Command::Pfwd { version: SMP_VERSION, command_key: spki_x25519(&eph.public.to_bytes()), enc };
+        let pt = Transmission {
+            authenticator: Vec::new(),
+            corr_id: t.corr_id.clone(),
+            entity_id: session_id.clone(),
+            command: encode_command(&pfwd_cmd).map_err(map_e)?,
+        };
+        let pwire = encode_transmission(&pt).map_err(map_e)?;
+        let blk = encode_block(&[pwire]).map_err(map_e)?;
+        write_block(&mut self.stream, &blk).map_err(map_e)?;
+        let msgs = self.recv_block()?;
+        for m in &msgs {
+            if let BrokerMsg::Pres { enc } = m {
+                let rn = crate::proxy::reverse_nonce(&nonce);
+                let plain = secretbox_decrypt(&client_sess, &rn, enc).ok_or("PRES decrypt failed")?;
+                let inner = unpad(&plain).map_err(map_e)?;
+                let it = decode_transmission(&inner).map_err(map_e)?;
+                return Ok(vec![parse_broker(&it.command).map_err(map_e)?]);
+            }
+        }
+        Ok(msgs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enable_strict_sets_swapped_client_chain_keys() {
+        let mut c = Client {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            session_id: b"sid".to_vec(),
+            strict_snd: None,
+            strict_rcv: None,
+            server_key_hash: vec![],
+            server_eph_pub: None,
+            eph_priv: None,
+        };
+        let secret = [7u8; 32];
+        c.enable_strict(&secret);
+        let (a, b) = crate::sb_chain::sbc_init(b"sid", &secret);
+        assert_eq!(c.strict_snd.unwrap(), b);
+        assert_eq!(c.strict_rcv.unwrap(), a);
+    }
+}

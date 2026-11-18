@@ -3,13 +3,26 @@ package com.example.data
 import android.content.Context
 import android.content.SharedPreferences
 import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+
+enum class PinCheckResult {
+    VALID,
+    DURESS_TRIGGERED,
+    INVALID
+}
 
 class SecurityPreferences(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("simplex_secure_prefs", Context.MODE_PRIVATE)
+    private val secureRandom = SecureRandom()
 
     companion object {
         private const val KEY_PIN_HASH = "sec_pin_hash"
+        private const val KEY_DURESS_PIN_HASH = "sec_duress_pin_hash"
         private const val KEY_LOCKOUT_TIME = "sec_lockout_time"
+        private const val KEY_FAILED_ATTEMPTS = "sec_failed_attempts"
+        private const val KEY_AUTO_LOCK_BG = "cfg_auto_lock_bg"
         private const val KEY_TOR_VPN_ENABLED = "cfg_tor_vpn"
         private const val KEY_TAILSCALE_ENABLED = "cfg_tailscale"
         private const val KEY_ONION_ADDRESS = "cfg_onion_address"
@@ -19,32 +32,158 @@ class SecurityPreferences(context: Context) {
         private const val KEY_DC_CLOUD_VAULT_SIZE = "cfg_dc_cloud_vault_size"
         private const val KEY_DC_CLOUD_AUTOCLEAR = "cfg_dc_cloud_autoclear"
         private const val KEY_DC_CLOUD_ENABLED = "cfg_dc_cloud_enabled"
+
+        private const val PBKDF2_PREFIX = "pbkdf2$"
+        private const val PBKDF2_ITERATIONS = 120_000
+        private const val PBKDF2_KEY_BITS = 256
+        private const val SALT_BYTES = 16
     }
 
-    // Hash the 6-digit PIN securely using SHA-256
-    private fun sha256(input: String): String {
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    private fun hexToBytes(hex: String): ByteArray? {
+        if (hex.length % 2 != 0) return null
+        return try {
+            ByteArray(hex.length / 2) { i ->
+                hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        } catch (_: NumberFormatException) {
+            null
+        }
+    }
+
+    private fun legacySha256(input: String): String {
         return MessageDigest.getInstance("SHA-256")
-            .digest(input.toByteArray())
-            .fold("") { str, it -> str + "%02x".format(it) }
+            .digest(input.toByteArray(Charsets.UTF_8))
+            .toHex()
+    }
+
+    private fun derivePbkdf2(pin: String, salt: ByteArray): ByteArray {
+        val chars = pin.toCharArray()
+        val spec = PBEKeySpec(chars, salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BITS)
+        return try {
+            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            factory.generateSecret(spec).encoded
+        } finally {
+            chars.fill('\u0000')
+            spec.clearPassword()
+        }
+    }
+
+    private fun encodePbkdf2Hash(pin: String): String {
+        val salt = ByteArray(SALT_BYTES)
+        secureRandom.nextBytes(salt)
+        val derived = derivePbkdf2(pin, salt)
+        return try {
+            "$PBKDF2_PREFIX${salt.toHex()}$${derived.toHex()}"
+        } finally {
+            derived.fill(0)
+            salt.fill(0)
+        }
+    }
+
+    private fun verifyPbkdf2Match(pin: String, savedHash: String?): Boolean {
+        if (savedHash.isNullOrEmpty() || !savedHash.startsWith(PBKDF2_PREFIX)) return false
+        val parts = savedHash.removePrefix(PBKDF2_PREFIX).split('$')
+        if (parts.size != 2) return false
+        val salt = hexToBytes(parts[0]) ?: return false
+        val expected = hexToBytes(parts[1]) ?: return false
+        val candidate = derivePbkdf2(pin, salt)
+        return try {
+            MessageDigest.isEqual(candidate, expected)
+        } finally {
+            candidate.fill(0)
+            expected.fill(0)
+            salt.fill(0)
+        }
     }
 
     fun isPinSet(): Boolean {
         return prefs.getString(KEY_PIN_HASH, null) != null
     }
 
+    fun hasDuressPin(): Boolean {
+        return prefs.getString(KEY_DURESS_PIN_HASH, null) != null
+    }
+
     fun setPin(pin: String): Boolean {
         if (pin.length != 6 || !pin.all { it.isDigit() }) return false
-        val hashed = sha256(pin)
-        prefs.edit().putString(KEY_PIN_HASH, hashed).apply()
+        // Reject primary PIN if it collides with an active Duress PIN
+        val existingDuress = prefs.getString(KEY_DURESS_PIN_HASH, null)
+        if (verifyPbkdf2Match(pin, existingDuress)) return false
+
+        val encoded = encodePbkdf2Hash(pin)
+        prefs.edit()
+            .putString(KEY_PIN_HASH, encoded)
+            .putInt(KEY_FAILED_ATTEMPTS, 0)
+            .apply()
         return true
+    }
+
+    fun setDuressPin(pin: String): Boolean {
+        if (pin.length != 6 || !pin.all { it.isDigit() }) return false
+        // Duress PIN must require an active primary PIN and must never equal it
+        if (!isPinSet() || verifyPin(pin)) return false
+
+        val encoded = encodePbkdf2Hash(pin)
+        prefs.edit()
+            .putString(KEY_DURESS_PIN_HASH, encoded)
+            .apply()
+        return true
+    }
+
+    fun clearDuressPin() {
+        prefs.edit().remove(KEY_DURESS_PIN_HASH).apply()
     }
 
     fun verifyPin(pin: String): Boolean {
         val savedHash = prefs.getString(KEY_PIN_HASH, null) ?: return false
-        return sha256(pin) == savedHash
+        val matched = if (savedHash.startsWith(PBKDF2_PREFIX)) {
+            verifyPbkdf2Match(pin, savedHash)
+        } else {
+            // Transparently verify and upgrade legacy unsalted SHA-256 hashes
+            val legacyCandidate = legacySha256(pin).toByteArray(Charsets.UTF_8)
+            val legacySaved = savedHash.toByteArray(Charsets.UTF_8)
+            val ok = MessageDigest.isEqual(legacyCandidate, legacySaved)
+            if (ok) {
+                setPin(pin)
+            }
+            ok
+        }
+
+        if (matched) {
+            prefs.edit().putInt(KEY_FAILED_ATTEMPTS, 0).apply()
+        }
+        return matched
     }
 
-    // Error code 30-sec lockout handling
+    fun verifyPinWithDuress(pin: String): PinCheckResult {
+        if (verifyPin(pin)) {
+            return PinCheckResult.VALID
+        }
+        val duressHash = prefs.getString(KEY_DURESS_PIN_HASH, null)
+        if (verifyPbkdf2Match(pin, duressHash)) {
+            return PinCheckResult.DURESS_TRIGGERED
+        }
+        return PinCheckResult.INVALID
+    }
+
+    fun recordFailedPinAttempt(): Long {
+        val attempts = prefs.getInt(KEY_FAILED_ATTEMPTS, 0) + 1
+        // Progressive lockout: 30s base, doubled every extra consecutive failure up to 5 min
+        val multiplier = 1L shl (attempts - 1).coerceAtMost(3)
+        val durationMs = (30_000L * multiplier).coerceAtMost(300_000L)
+        val until = System.currentTimeMillis() + durationMs
+        prefs.edit()
+            .putInt(KEY_FAILED_ATTEMPTS, attempts)
+            .putLong(KEY_LOCKOUT_TIME, until)
+            .apply()
+        return durationMs
+    }
+
+    fun getFailedPinAttempts(): Int = prefs.getInt(KEY_FAILED_ATTEMPTS, 0)
+
+    // Error code lockout handling
     fun setLockoutUntil(timestamp: Long) {
         prefs.edit().putLong(KEY_LOCKOUT_TIME, timestamp).apply()
     }
@@ -54,6 +193,10 @@ class SecurityPreferences(context: Context) {
         val remaining = lockoutUntil - currentTime
         return if (remaining > 0) remaining else 0L
     }
+
+    var isAutoLockOnBackgroundEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_LOCK_BG, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_LOCK_BG, value).apply()
 
     // Config Toggles
     var isTorVpnEnabled: Boolean

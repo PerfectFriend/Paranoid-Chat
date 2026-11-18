@@ -111,12 +111,15 @@ class AudioHelper(private val context: Context) {
         StopStreams()
         try {
             val files = context.cacheDir.listFiles()
+            var wipedCount = 0
             files?.forEach { file ->
                 if (file.name.startsWith("sec_voice_")) {
-                    file.delete()
+                    if (com.example.core.SecureFileShredder.shredFile(file)) {
+                        wipedCount++
+                    }
                 }
             }
-            ZeroLogEngine.log("Audio", "All cryptographic voice caches wiped.")
+            ZeroLogEngine.log("Audio", "Cryptographic voice caches shredded ($wipedCount files).")
         } catch (e: Exception) {
             ZeroLogEngine.log("Audio", "Error sweeping audio cache: ${e.message}", "ERROR")
         }

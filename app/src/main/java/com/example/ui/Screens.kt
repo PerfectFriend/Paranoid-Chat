@@ -1,7 +1,13 @@
 package com.example.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -10,6 +16,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -307,201 +317,316 @@ fun MainDashboard(viewModel: ChatViewModel) {
 
     val isTorVpn by viewModel.isTorVpnEnabled.collectAsStateWithLifecycle()
     val isTailscale by viewModel.isTailscaleEnabled.collectAsStateWithLifecycle()
-    val onionAddr by viewModel.onionServerAddress.collectAsStateWithLifecycle()
     val selectedContact by viewModel.selectedContact.collectAsStateWithLifecycle()
 
     var showPanicConfirm by remember { mutableStateOf(false) }
     var showServerSettings by remember { mutableStateOf(false) }
     val keyboardController = LocalParanoidKeyboard.current
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Surface(
-                            modifier = Modifier.size(8.dp),
-                            color = SecureGreenGlow,
-                            shape = CircleShape
-                        ) {}
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "PARANOID Node",
-                            color = SecureTextWhite,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                },
-                actions = {
-                    // Quick VPN status tags
-                    Row(
-                        modifier = Modifier.padding(end = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        NetworkIndicatorTag(label = "TOR", active = isTorVpn)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        NetworkIndicatorTag(label = "TS", active = isTailscale)
-                        Spacer(modifier = Modifier.width(12.dp))
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val isExpandedLayout = maxWidth >= 840.dp
 
-                        // Settings Icon to Open Server Controls Dialog
-                        IconButton(
-                            onClick = { showServerSettings = true },
-                            modifier = Modifier
-                                .size(32.dp)
-                                .background(SecureSlate, CircleShape)
-                                .testTag("settings_gear_btn")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Settings,
-                                contentDescription = "Backend Tunnel Config",
-                                tint = SecureGreenGlow,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
+        BackHandler(enabled = !isExpandedLayout && selectedContact != null && keyboardController?.isVisible != true) {
+            viewModel.setContact(null)
+        }
 
-                        // Flashing Warning PANIC BUTTON
-                        Button(
-                            onClick = { showPanicConfirm = true },
-                            colors = ButtonDefaults.buttonColors(containerColor = SecureRedPanic),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                            shape = RoundedCornerShape(4.dp),
-                            modifier = Modifier
-                                .height(32.dp)
-                                .testTag("panic_btn")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Warning,
-                                contentDescription = "Emergency Wipe Trigger",
-                                tint = Color.White,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                "PANIC",
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Black,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SecureDarkSurface,
-                    scrolledContainerColor = SecureDarkSurface
-                )
-            )
-        },
-        bottomBar = {
-            if (keyboardController?.isVisible != true) {
-                NavigationBar(
-                    containerColor = SecureDarkSurface,
-                    modifier = Modifier.navigationBarsPadding(),
-                    tonalElevation = 8.dp
-                ) {
-                NavigationBarItem(
-                    selected = currentTab == 0,
-                    onClick = {
-                        currentTab = 0
-                        viewModel.setContact(null)
-                    },
-                    icon = { Icon(Icons.Filled.Email, contentDescription = "Chats") },
-                    label = { Text("Lanes", fontFamily = FontFamily.Monospace) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = SecureGreenGlow,
-                        selectedTextColor = SecureGreenGlow,
-                        unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
-                        unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
-                        indicatorColor = SecureGreenMuted
-                    )
-                )
-                    NavigationBarItem(
-                        selected = currentTab == 1,
-                        onClick = { currentTab = 1 },
-                        icon = { Icon(Icons.Filled.Share, contentDescription = "SimpleX Routing Network") },
-                        label = { Text("Nodes Net", fontFamily = FontFamily.Monospace) },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = SecureGreenGlow,
-                            selectedTextColor = SecureGreenGlow,
-                            unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
-                            unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
-                            indicatorColor = SecureGreenMuted
-                        )
-                    )
-                }
-            }
-        },
-        containerColor = SecureDarkBackground
-    ) { innerPadding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-        ) {
-            when {
-                selectedContact != null -> {
-                    // Chat Conversation Screen takes over priorities
-                    ChatDetailScreen(viewModel = viewModel, contact = selectedContact!!)
-                }
-                currentTab == 0 -> {
-                    ChatsListTab(viewModel)
-                }
-                currentTab == 1 -> {
-                    RoutingNetworkTab(viewModel)
-                }
-            }
-
-            // Panic Confirmation Modal Dialog
-            if (showPanicConfirm) {
-                AlertDialog(
-                    onDismissRequest = { showPanicConfirm = false },
-                    containerColor = SecureDarkSurface,
-                    shape = RoundedCornerShape(16.dp),
+        Scaffold(
+            topBar = {
+                TopAppBar(
                     title = {
-                        Text(
-                            text = "⚠️ IRREVERSIBLE COLD WIPE",
-                            color = SecureRedPanic,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 18.sp
-                        )
-                    },
-                    text = {
-                        Text(
-                            text = "This will immediately wipe all secure keys, active messaging cache, file residues, user identities, and reset the Master PIN.\n\nAll data is overwritten in RAM and flash with zeroes. Confirm emergency action?",
-                            color = SecureTextWhite,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 13.sp
-                        )
-                    },
-                    confirmButton = {
-                        Button(
-                            onClick = {
-                                showPanicConfirm = false
-                                viewModel.executePanicButtonPurge()
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = SecureRedPanic)
-                        ) {
-                            Text("EXECUTE WIPEOUT", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Surface(
+                                modifier = Modifier.size(8.dp),
+                                color = SecureGreenGlow,
+                                shape = CircleShape
+                            ) {}
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "PARANOID Node",
+                                color = SecureTextWhite,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
                     },
-                    dismissButton = {
-                        TextButton(
-                            onClick = { showPanicConfirm = false }
+                    actions = {
+                        Row(
+                            modifier = Modifier.padding(end = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("ABORT", color = SecureTextWhite, fontFamily = FontFamily.Monospace)
-                        }
-                    },
-                    modifier = Modifier.testTag("panic_confirm_dialog")
-                )
-            }
+                            NetworkIndicatorTag(label = "TOR", active = isTorVpn)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            NetworkIndicatorTag(label = "TS", active = isTailscale)
+                            Spacer(modifier = Modifier.width(4.dp))
 
-            // Server Configuration and Logs Settings Dialog
-            if (showServerSettings) {
-                ServerSettingsModal(viewModel = viewModel, onDismiss = { showServerSettings = false })
+                            // 1-Tap Manual Session Lock Button (48dp touch target)
+                            IconButton(
+                                onClick = { viewModel.lockSession() },
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .testTag("lock_session_btn")
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .background(SecureSlate, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Lock,
+                                        contentDescription = "Lock Session Immediately",
+                                        tint = SecureAccentBlue,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            // Settings Icon to Open Server Controls Dialog (48dp touch target)
+                            IconButton(
+                                onClick = { showServerSettings = true },
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .testTag("settings_gear_btn")
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .background(SecureSlate, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Settings,
+                                        contentDescription = "Backend Tunnel Config",
+                                        tint = SecureGreenGlow,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            // Flashing Warning PANIC BUTTON
+                            Button(
+                                onClick = { showPanicConfirm = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = SecureRedPanic),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier
+                                    .defaultMinSize(minWidth = 48.dp, minHeight = 36.dp)
+                                    .testTag("panic_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Warning,
+                                    contentDescription = "Emergency Wipe Trigger",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    "PANIC",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Black,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = SecureDarkSurface,
+                        scrolledContainerColor = SecureDarkSurface
+                    )
+                )
+            },
+            bottomBar = {
+                if (!isExpandedLayout && keyboardController?.isVisible != true) {
+                    NavigationBar(
+                        containerColor = SecureDarkSurface,
+                        modifier = Modifier.navigationBarsPadding(),
+                        tonalElevation = 8.dp
+                    ) {
+                        NavigationBarItem(
+                            selected = currentTab == 0,
+                            onClick = {
+                                currentTab = 0
+                                viewModel.setContact(null)
+                            },
+                            icon = { Icon(Icons.Filled.Email, contentDescription = "Chats") },
+                            label = { Text("Lanes", fontFamily = FontFamily.Monospace) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = SecureGreenGlow,
+                                selectedTextColor = SecureGreenGlow,
+                                unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
+                                unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
+                                indicatorColor = SecureGreenMuted
+                            )
+                        )
+                        NavigationBarItem(
+                            selected = currentTab == 1,
+                            onClick = { currentTab = 1 },
+                            icon = { Icon(Icons.Filled.Share, contentDescription = "SimpleX Routing Network") },
+                            label = { Text("Nodes Net", fontFamily = FontFamily.Monospace) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = SecureGreenGlow,
+                                selectedTextColor = SecureGreenGlow,
+                                unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
+                                unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
+                                indicatorColor = SecureGreenMuted
+                            )
+                        )
+                    }
+                }
+            },
+            containerColor = SecureDarkBackground
+        ) { innerPadding ->
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                if (isExpandedLayout) {
+                    NavigationRail(
+                        containerColor = SecureDarkSurface,
+                        modifier = Modifier.fillMaxHeight()
+                    ) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        NavigationRailItem(
+                            selected = currentTab == 0,
+                            onClick = { currentTab = 0 },
+                            icon = { Icon(Icons.Filled.Email, contentDescription = "Chats") },
+                            label = { Text("Lanes", fontFamily = FontFamily.Monospace, fontSize = 10.sp) },
+                            colors = NavigationRailItemDefaults.colors(
+                                selectedIconColor = SecureGreenGlow,
+                                selectedTextColor = SecureGreenGlow,
+                                unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
+                                unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
+                                indicatorColor = SecureGreenMuted
+                            )
+                        )
+                        NavigationRailItem(
+                            selected = currentTab == 1,
+                            onClick = { currentTab = 1 },
+                            icon = { Icon(Icons.Filled.Share, contentDescription = "SimpleX Routing Network") },
+                            label = { Text("Nodes", fontFamily = FontFamily.Monospace, fontSize = 10.sp) },
+                            colors = NavigationRailItemDefaults.colors(
+                                selectedIconColor = SecureGreenGlow,
+                                selectedTextColor = SecureGreenGlow,
+                                unselectedIconColor = SecureTextWhite.copy(alpha = 0.5f),
+                                unselectedTextColor = SecureTextWhite.copy(alpha = 0.5f),
+                                indicatorColor = SecureGreenMuted
+                            )
+                        )
+                    }
+                    VerticalDivider(color = SecureSlate, thickness = 1.dp)
+                }
+
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    if (isExpandedLayout) {
+                        when (currentTab) {
+                            0 -> Row(modifier = Modifier.fillMaxSize()) {
+                                Box(modifier = Modifier.widthIn(min = 280.dp, max = 360.dp).fillMaxHeight()) {
+                                    ChatsListTab(viewModel)
+                                }
+                                VerticalDivider(color = SecureSlate, thickness = 1.dp)
+                                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                                    val active = selectedContact
+                                    if (active != null) {
+                                        ChatDetailScreen(
+                                            viewModel = viewModel,
+                                            contact = active,
+                                            showBackArrow = false
+                                        )
+                                    } else {
+                                        Box(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Lock,
+                                                    contentDescription = "Select a lane",
+                                                    tint = SecureSlate,
+                                                    modifier = Modifier.size(56.dp)
+                                                )
+                                                Spacer(modifier = Modifier.height(12.dp))
+                                                Text(
+                                                    text = "SELECT A SECURE LANE TO DECRYPT QUEUES",
+                                                    color = SecureTextWhite.copy(alpha = 0.4f),
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontSize = 12.sp
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else -> RoutingNetworkTab(viewModel)
+                        }
+                    } else {
+                        when {
+                            selectedContact != null -> {
+                                ChatDetailScreen(viewModel = viewModel, contact = selectedContact!!)
+                            }
+                            currentTab == 0 -> {
+                                ChatsListTab(viewModel)
+                            }
+                            currentTab == 1 -> {
+                                RoutingNetworkTab(viewModel)
+                            }
+                        }
+                    }
+
+                    // Panic Confirmation Modal Dialog
+                    if (showPanicConfirm) {
+                        AlertDialog(
+                            onDismissRequest = { showPanicConfirm = false },
+                            containerColor = SecureDarkSurface,
+                            shape = RoundedCornerShape(16.dp),
+                            title = {
+                                Text(
+                                    text = "⚠️ IRREVERSIBLE COLD WIPE",
+                                    color = SecureRedPanic,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 18.sp
+                                )
+                            },
+                            text = {
+                                Text(
+                                    text = "This will immediately wipe all secure keys, active messaging cache, file residues, user identities, and reset the Master PIN.\n\nAll data is overwritten in RAM and flash with zeroes. Confirm emergency action?",
+                                    color = SecureTextWhite,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 13.sp
+                                )
+                            },
+                            confirmButton = {
+                                Button(
+                                    onClick = {
+                                        showPanicConfirm = false
+                                        viewModel.executePanicButtonPurge()
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = SecureRedPanic)
+                                ) {
+                                    Text("EXECUTE WIPEOUT", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(
+                                    onClick = { showPanicConfirm = false }
+                                ) {
+                                    Text("ABORT", color = SecureTextWhite, fontFamily = FontFamily.Monospace)
+                                }
+                            },
+                            modifier = Modifier.testTag("panic_confirm_dialog")
+                        )
+                    }
+
+                    // Server Configuration and Logs Settings Dialog
+                    if (showServerSettings) {
+                        ServerSettingsModal(viewModel = viewModel, onDismiss = { showServerSettings = false })
+                    }
+                }
             }
         }
     }
@@ -556,39 +681,50 @@ fun ChatsListTab(viewModel: ChatViewModel) {
                 letterSpacing = 1.sp
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Room creation trigger button
+                // Room creation trigger button (48dp touch target)
                 IconButton(
                     onClick = { showCreateRoomDialog = true },
                     modifier = Modifier
-                        .padding(end = 8.dp)
-                        .size(28.dp)
-                        .background(SecureSlate, CircleShape)
+                        .size(48.dp)
                         .testTag("create_room_trigger_btn")
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.Share,
-                        contentDescription = "Create Secure Chat Room",
-                        tint = SecureAccentBlue,
-                        modifier = Modifier.size(14.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .background(SecureSlate, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Share,
+                            contentDescription = "Create Secure Chat Room",
+                            tint = SecureAccentBlue,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
 
-                // Add Connection Link button
+                // Add Connection Link button (48dp touch target)
                 IconButton(
                     onClick = { showAddContactDialog = true },
                     modifier = Modifier
-                        .size(28.dp)
-                        .background(SecureGreenMuted, CircleShape)
+                        .size(48.dp)
                         .testTag("add_contact_trigger_btn")
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.Add,
-                        contentDescription = "New SimpleX Pair Link",
-                        tint = SecureGreenGlow,
-                        modifier = Modifier.size(16.dp)
-                )
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .background(SecureGreenMuted, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = "New SimpleX Pair Link",
+                            tint = SecureGreenGlow,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
             }
-        }
         }
 
         if (contacts.isEmpty()) {
@@ -838,17 +974,31 @@ fun ChatsListTab(viewModel: ChatViewModel) {
                             }
                         }
                         Text(
-                            text = "ℹ️ Select text inside the box to copy invitation.",
-                            color = SecureTextWhite.copy(alpha = 0.5f),
+                            text = "ℹ️ Sensitive copy hides preview (Android 13+) and auto-wipes in 30s.",
+                            color = SecureTextWhite.copy(alpha = 0.55f),
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace
                         )
                     }
                 },
+                dismissButton = {
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.copySensitiveWithAutoClear(lastGeneratedInvite!!.inviteLink, "Room Invite")
+                        },
+                        border = BorderStroke(1.dp, SecureAccentBlue.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("copy_room_invite_btn")
+                    ) {
+                        Text("Copy (30s)", color = SecureAccentBlue, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    }
+                },
                 confirmButton = {
                     Button(
                         onClick = { viewModel.clearLastGeneratedInvite() },
-                        colors = ButtonDefaults.buttonColors(containerColor = SecureGreenMuted)
+                        colors = ButtonDefaults.buttonColors(containerColor = SecureGreenMuted),
+                        modifier = Modifier.defaultMinSize(minHeight = 48.dp)
                     ) {
                         Text("Done", color = SecureGreenGlow, fontFamily = FontFamily.Monospace)
                     }
@@ -913,7 +1063,7 @@ fun ContactRow(contact: Contact, onClick: () -> Unit) {
                 )
             }
             Icon(
-                imageVector = Icons.Filled.KeyboardArrowRight,
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = "Open Lanes",
                 tint = SecureTextWhite.copy(alpha = 0.3f)
             )
@@ -927,6 +1077,10 @@ fun ServerControlTab(viewModel: ChatViewModel) {
     val isTailscale by viewModel.isTailscaleEnabled.collectAsStateWithLifecycle()
     val hostOnion by viewModel.onionServerAddress.collectAsStateWithLifecycle()
     val tsIp by viewModel.tailscaleNodeIp.collectAsStateWithLifecycle()
+    val coreStatus by viewModel.coreStatus.collectAsStateWithLifecycle()
+    val isAutoLockEnabled by viewModel.isAutoLockEnabled.collectAsStateWithLifecycle()
+    val keystoreModeLabel by viewModel.keystoreModeLabel.collectAsStateWithLifecycle()
+    val clipboardNotice by viewModel.clipboardNotice.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier
@@ -949,6 +1103,69 @@ fun ServerControlTab(viewModel: ChatViewModel) {
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
             )
+        }
+
+        // Core Engine & Security Runtime Card
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SecureDarkSurface),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (coreStatus.nativeLibraryPresent) SecureGreenGlow.copy(alpha = 0.6f) else SecureAccentBlue.copy(alpha = 0.4f)
+                ),
+                modifier = Modifier.testTag("core_runtime_card")
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "⚙️ PARANOID CORE ENGINE",
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = SecureTextWhite
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = if (coreStatus.nativeLibraryPresent) SecureGreenMuted else SecureDeepBlue
+                        ) {
+                            Text(
+                                text = if (coreStatus.nativeLibraryPresent) "RUST FFI READY" else "STAGING BRIDGE",
+                                color = if (coreStatus.nativeLibraryPresent) SecureGreenGlow else SecureAccentBlue,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                    Text(
+                        text = "Backend: ${coreStatus.backend.label} | ${coreStatus.protocolSpec}",
+                        color = SecureTextWhite.copy(alpha = 0.7f),
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Vault: $keystoreModeLabel",
+                        color = SecureAccentBlue.copy(alpha = 0.85f),
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        NetworkIndicatorTag("FLAG_SECURE", coreStatus.screenshotShieldActive)
+                        NetworkIndicatorTag("DB-GCM", true)
+                        NetworkIndicatorTag("KEYSTORE-GCM", coreStatus.keystoreVaultActive)
+                        NetworkIndicatorTag("PQDR-E2E", coreStatus.pqdrMandatory)
+                    }
+                }
+            }
         }
 
         // Section A: Tor Hidden Service (.onion queue address)
@@ -1014,19 +1231,52 @@ fun ServerControlTab(viewModel: ChatViewModel) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Local Port Listener: 5223",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = SecureTextWhite.copy(alpha = 0.4f)
+                            )
+                            Text(
+                                "Tor Circuit Consensus: YES",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = SecureGreenGlow
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.copySensitiveWithAutoClear(hostOnion, "Tor Onion Host") },
+                            border = BorderStroke(1.dp, SecureAccentBlue.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .defaultMinSize(minHeight = 48.dp)
+                                .testTag("copy_host_onion_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Share,
+                                contentDescription = "Copy sensitive onion host",
+                                tint = SecureAccentBlue,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Copy (30s)",
+                                color = SecureAccentBlue,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    AnimatedVisibility(visible = clipboardNotice != null) {
                         Text(
-                            "Local Port Listener: 5223",
-                            fontSize = 11.sp,
+                            text = clipboardNotice.orEmpty(),
+                            color = SecureGreenGlow,
+                            fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = SecureTextWhite.copy(alpha = 0.4f)
-                        )
-                        Text(
-                            "Tor Circuit Consensus: YES",
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = SecureGreenGlow
+                            modifier = Modifier.padding(top = 8.dp)
                         )
                     }
                 }
@@ -1133,6 +1383,65 @@ fun ServerControlTab(viewModel: ChatViewModel) {
                     )
                 }
             }
+        }
+
+        // Section D: Background Auto-Lock Shield
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SecureDarkSurface),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, SecureSlate)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "🛡️ AUTO-LOCK ON BACKGROUND",
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = SecureTextWhite
+                            )
+                            Text(
+                                text = "Require 6-digit PBKDF2 PIN when returning to app",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = SecureTextWhite.copy(alpha = 0.5f)
+                            )
+                        }
+                        Switch(
+                            checked = isAutoLockEnabled,
+                            onCheckedChange = { viewModel.setAutoLockOnBackground(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = SecureGreenGlow,
+                                checkedTrackColor = SecureGreenMuted,
+                                uncheckedThumbColor = SecureTextWhite.copy(alpha = 0.3f),
+                                uncheckedTrackColor = SecureSlate
+                            ),
+                            modifier = Modifier.testTag("auto_lock_switch")
+                        )
+                    }
+                }
+            }
+        }
+
+        // Section E: Node EC P-256 Identity & Rotation
+        item {
+            NodeIdentityCard(viewModel)
+        }
+
+        // Section F: Duress (Panic) PIN
+        item {
+            DuressPinConfigCard(viewModel)
+        }
+
+        // Section G: Encrypted .pvault SAF Backup & Restore
+        item {
+            EncryptedSnapshotCard(viewModel)
         }
     }
 }
@@ -1816,7 +2125,7 @@ fun RoutingNetworkTab(viewModel: ChatViewModel) {
                             hops.forEachIndexed { index, node ->
                                 // Transition arrow
                                 Icon(
-                                    imageVector = Icons.Filled.ArrowForward,
+                                    imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                                     contentDescription = null,
                                     tint = SecureGreenGlow,
                                     modifier = Modifier.size(12.dp)
@@ -1850,7 +2159,7 @@ fun RoutingNetworkTab(viewModel: ChatViewModel) {
 
                             // Peer Node Target
                             Icon(
-                                imageVector = Icons.Filled.ArrowForward,
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                                 contentDescription = null,
                                 tint = SecureGreenGlow,
                                 modifier = Modifier.size(12.dp)
@@ -1870,7 +2179,7 @@ fun RoutingNetworkTab(viewModel: ChatViewModel) {
                         }
 
                         Spacer(modifier = Modifier.height(16.dp))
-                        Divider(color = SecureSlate, thickness = 1.dp)
+                        HorizontalDivider(color = SecureSlate, thickness = 1.dp)
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -2001,10 +2310,16 @@ fun RoutingNetworkTab(viewModel: ChatViewModel) {
 }
 
 @Composable
-fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
+fun ChatDetailScreen(
+    viewModel: ChatViewModel,
+    contact: Contact,
+    showBackArrow: Boolean = true
+) {
     val messages by viewModel.currentChatMessages.collectAsStateWithLifecycle()
     val isRecordingVoice by viewModel.isRecordingVoice.collectAsStateWithLifecycle()
     val recordingDurationSec by viewModel.recordingDurationSec.collectAsStateWithLifecycle()
+    val permissionNotice by viewModel.permissionNotice.collectAsStateWithLifecycle()
+    val messageTtlMs by viewModel.messageTtlMs.collectAsStateWithLifecycle()
 
     var textInput by remember { mutableStateOf("") }
     var expandedAttachmentsMenu by remember { mutableStateOf(false) }
@@ -2012,9 +2327,69 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
     var showRoomInviteDialog by remember { mutableStateOf(false) }
     var showSendFileDialog by remember { mutableStateOf(false) }
     var showSendPhotoDialog by remember { mutableStateOf(false) }
+    var showShredDialog by remember { mutableStateOf(false) }
+    var showSafetyNumberDialog by remember { mutableStateOf(false) }
 
+    val ttlLabel = remember(messageTtlMs) {
+        if (messageTtlMs < 3_600_000L) "${messageTtlMs / 60_000L}m" else "${messageTtlMs / 3_600_000L}h"
+    }
+
+    val context = LocalContext.current
     val keyboardController = LocalParanoidKeyboard.current
     val focusManager = LocalFocusManager.current
+
+    var pendingAudioAction by remember { mutableStateOf<String?>(null) }
+
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val action = pendingAudioAction
+        pendingAudioAction = null
+        if (granted) {
+            when (action) {
+                "voice_record" -> viewModel.startVoiceRecording()
+                "voice_call" -> viewModel.requestVoiceCall(contact)
+            }
+        } else {
+            viewModel.reportAudioPermissionDenied(
+                if (action == "voice_call") "encrypted voice calls" else "voice memo recording"
+            )
+        }
+    }
+
+    fun launchWithAudioPermission(action: String) {
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            when (action) {
+                "voice_record" -> viewModel.startVoiceRecording()
+                "voice_call" -> viewModel.requestVoiceCall(contact)
+            }
+        } else {
+            pendingAudioAction = action
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.shareRealPickedMedia(uri, isImage = true)
+            showSendPhotoDialog = false
+        }
+    }
+
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.shareRealPickedMedia(uri, isImage = false)
+            showSendFileDialog = false
+        }
+    }
 
     BackHandler(enabled = keyboardController?.isVisible == true) {
         keyboardController?.hide()
@@ -2034,22 +2409,25 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
             .fillMaxSize()
             .background(SecureDarkBackground)
     ) {
-        // Chat Header with details and voice call trigger
+        // Chat Header with details, TTL policy chip, Shred action, and voice call trigger
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(SecureDarkSurface)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
-                onClick = { viewModel.setContact(null) }
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.KeyboardArrowLeft,
-                    contentDescription = "Back",
-                    tint = SecureGreenGlow
-                )
+            if (showBackArrow) {
+                IconButton(
+                    onClick = { viewModel.setContact(null) },
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                        contentDescription = "Back",
+                        tint = SecureGreenGlow
+                    )
+                }
             }
 
             Box(
@@ -2066,7 +2444,7 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                 )
             }
 
-            Spacer(modifier = Modifier.width(12.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -2074,19 +2452,25 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                     color = SecureTextWhite,
                     fontWeight = FontWeight.Bold,
                     fontSize = 14.sp,
-                    fontFamily = FontFamily.Monospace
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = if (isRoom) "MULTIPoint ROOM" else "TTL ACTIVE: 24h Queue",
+                        text = if (isRoom) "MULTIPoint ROOM" else "TTL $ttlLabel Queue",
                         color = if (isRoom) SecureAccentBlue else SecureGreenGlow,
                         fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .clickable { viewModel.cycleMessageTtlPreset() }
+                            .padding(end = 6.dp, top = 2.dp, bottom = 2.dp)
+                            .testTag("ttl_selector_btn")
                     )
                     if (isRoom) {
-                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "• INVITE LINK",
+                            text = "• INVITE",
                             color = SecureGreenGlow,
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
@@ -2099,16 +2483,203 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                 }
             }
 
-            // Secure P2P Call Trigger
+            // Out-of-band Peer Safety Number Verification
             IconButton(
-                onClick = { viewModel.requestVoiceCall(contact) },
-                modifier = Modifier.testTag("voice_call_btn")
+                onClick = { showSafetyNumberDialog = true },
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("verify_safety_btn")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Lock,
+                    contentDescription = "Verify Peer Safety Number",
+                    tint = SecureAccentBlue
+                )
+            }
+
+            // Per-chat Shred / Burn Trigger
+            IconButton(
+                onClick = { showShredDialog = true },
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("shred_chat_btn")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Clear or Shred Lane",
+                    tint = SecureRedPanic.copy(alpha = 0.85f)
+                )
+            }
+
+            // Secure P2P Call Trigger (with runtime RECORD_AUDIO check)
+            IconButton(
+                onClick = { launchWithAudioPermission("voice_call") },
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("voice_call_btn")
             ) {
                 Icon(
                     imageVector = Icons.Filled.Phone,
                     contentDescription = "Tor/TS Voice Call",
                     tint = SecureGreenGlow
                 )
+            }
+        }
+
+        if (showShredDialog) {
+            AlertDialog(
+                onDismissRequest = { showShredDialog = false },
+                containerColor = SecureDarkSurface,
+                shape = RoundedCornerShape(12.dp),
+                title = {
+                    Text(
+                        text = "SHRED LANE DATA",
+                        color = SecureRedPanic,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                },
+                text = {
+                    Text(
+                        text = "Overwrite cached attachments and delete messages for '${contact.displayName}', or permanently unlink this contact queue.",
+                        color = SecureTextWhite.copy(alpha = 0.8f),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
+                },
+                confirmButton = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                showShredDialog = false
+                                viewModel.shredConversation(contact, deleteContact = false)
+                            }
+                        ) {
+                            Text("CLEAR CHAT", color = SecureAccentBlue, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = {
+                                showShredDialog = false
+                                viewModel.shredConversation(contact, deleteContact = true)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = SecureRedPanic)
+                        ) {
+                            Text("SHRED LANE", color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                        }
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showShredDialog = false }) {
+                        Text("CANCEL", color = SecureTextWhite, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    }
+                },
+                modifier = Modifier.testTag("shred_lane_dialog")
+            )
+        }
+
+        if (showSafetyNumberDialog) {
+            val safetyNumber = remember(contact.id, contact.publicKey) {
+                viewModel.getPeerSafetyNumber(contact)
+            }
+            val localFp by viewModel.localNodeFingerprint.collectAsStateWithLifecycle()
+            AlertDialog(
+                onDismissRequest = { showSafetyNumberDialog = false },
+                containerColor = SecureDarkSurface,
+                shape = RoundedCornerShape(12.dp),
+                title = {
+                    Text(
+                        text = "PEER SAFETY VERIFICATION",
+                        color = SecureGreenGlow,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            text = "Compare this 60-digit safety number out-of-band with '${contact.displayName}' to rule out MITM:",
+                            color = SecureTextWhite.copy(alpha = 0.75f),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SecureDarkBackground, RoundedCornerShape(6.dp))
+                                .border(1.dp, SecureSlate, RoundedCornerShape(6.dp))
+                                .padding(12.dp)
+                        ) {
+                            Text(
+                                text = safetyNumber,
+                                color = SecureGreenGlow,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp
+                            )
+                        }
+                        Text(
+                            text = "Local EC P-256: $localFp",
+                            color = SecureAccentBlue.copy(alpha = 0.8f),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
+                        )
+                        Text(
+                            text = "Peer Key: ${contact.publicKey}",
+                            color = SecureTextWhite.copy(alpha = 0.55f),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
+                        )
+                    }
+                },
+                dismissButton = {
+                    OutlinedButton(
+                        onClick = { viewModel.copySensitiveWithAutoClear(safetyNumber, "Safety Number") },
+                        border = BorderStroke(1.dp, SecureAccentBlue.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("copy_safety_number_btn")
+                    ) {
+                        Text("Copy (30s)", color = SecureAccentBlue, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = { showSafetyNumberDialog = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = SecureGreenMuted),
+                        modifier = Modifier.defaultMinSize(minHeight = 48.dp)
+                    ) {
+                        Text("Verified", color = SecureGreenGlow, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    }
+                },
+                modifier = Modifier.testTag("safety_number_dialog")
+            )
+        }
+
+        // Runtime Permission Notice Banner
+        if (permissionNotice != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(SecureRedPanicMuted)
+                    .border(1.dp, SecureRedPanic.copy(alpha = 0.5f))
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                    .testTag("audio_permission_notice"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = permissionNotice ?: "",
+                    color = SecureTextWhite,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = { viewModel.clearPermissionNotice() }) {
+                    Text("DISMISS", color = SecureAccentBlue, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
             }
         }
 
@@ -2206,12 +2777,30 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                                 Text(contact.onionAddress, color = SecureAccentBlue, fontSize = 11.sp, fontFamily = FontFamily.Monospace, lineHeight = 15.sp)
                             }
                         }
+                        Text(
+                            text = "Sensitive copy marks clipboard secret (Android 13+) and auto-wipes in 30s.",
+                            color = SecureTextWhite.copy(alpha = 0.55f),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                },
+                dismissButton = {
+                    OutlinedButton(
+                        onClick = { viewModel.copySensitiveWithAutoClear(contact.onionAddress, "Room Handshake") },
+                        border = BorderStroke(1.dp, SecureAccentBlue.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("copy_room_handshake_btn")
+                    ) {
+                        Text("Copy (30s)", color = SecureAccentBlue, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
                     }
                 },
                 confirmButton = {
                     Button(
                         onClick = { showRoomInviteDialog = false },
-                        colors = ButtonDefaults.buttonColors(containerColor = SecureGreenMuted)
+                        colors = ButtonDefaults.buttonColors(containerColor = SecureGreenMuted),
+                        modifier = Modifier.defaultMinSize(minHeight = 48.dp)
                     ) {
                         Text("Done", color = SecureGreenGlow, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
                     }
@@ -2280,6 +2869,21 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                                 .focusRequester(extFocusRequester)
                                 .testTag("send_file_ext_input")
                         )
+                        OutlinedButton(
+                            onClick = { documentPickerLauncher.launch(arrayOf("*/*")) },
+                            border = BorderStroke(1.dp, SecureAccentBlue.copy(alpha = 0.6f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("pick_real_file_btn")
+                        ) {
+                            Text(
+                                "Select Real File from Device (SAF Stream)",
+                                color = SecureAccentBlue,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                        }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.End
@@ -2318,7 +2922,26 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                 },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Broadcast raw photos with ephemeral zero-traces to this queue. Select photo description context label:", color = SecureTextWhite.copy(alpha = 0.7f), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        Text("Broadcast raw photos with ephemeral zero-traces to this queue. Pick a real image via Android Photo Picker or select a preset label:", color = SecureTextWhite.copy(alpha = 0.7f), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        OutlinedButton(
+                            onClick = {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            border = BorderStroke(1.dp, SecureGreenGlow.copy(alpha = 0.6f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("pick_real_photo_btn")
+                        ) {
+                            Text(
+                                "Pick Image (Zero-Perm Photo Picker)",
+                                color = SecureGreenGlow,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                        }
                         listOf(
                             "thermal_satellite_mesh_east.png",
                             "identity_shield_raw_face.bmp",
@@ -2484,11 +3107,12 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                         onClick = {
                             keyboardController?.hide()
                             focusManager.clearFocus()
-                            viewModel.startVoiceRecording()
+                            launchWithAudioPermission("voice_record")
                         },
                         modifier = Modifier
-                            .size(40.dp)
+                            .size(48.dp)
                             .background(SecureSlate, CircleShape)
+                            .testTag("voice_record_btn")
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Lock,
@@ -2503,12 +3127,12 @@ fun ChatDetailScreen(viewModel: ChatViewModel, contact: Contact) {
                             textInput = ""
                         },
                         modifier = Modifier
-                            .size(40.dp)
+                            .size(48.dp)
                             .background(SecureGreenMuted, CircleShape)
                             .testTag("chat_send_btn")
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.Send,
+                            imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Transmit Queue",
                             tint = SecureGreenGlow
                         )
